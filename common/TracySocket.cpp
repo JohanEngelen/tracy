@@ -8,6 +8,7 @@
 
 #include "TracyAlloc.hpp"
 #include "TracySocket.hpp"
+#include "TracySystem.hpp"
 
 #ifdef _WIN32
 #  ifndef NOMINMAX
@@ -454,7 +455,7 @@ static int addrinfo_and_socket_for_family( uint16_t port, int ai_family, struct 
     hints.ai_family = ai_family;
     hints.ai_socktype = SOCK_STREAM;
 #ifndef TRACY_ONLY_LOCALHOST
-    const char* onlyLocalhost = getenv( "TRACY_ONLY_LOCALHOST" );
+    const char* onlyLocalhost = GetEnvVar( "TRACY_ONLY_LOCALHOST" );
     if( !onlyLocalhost || onlyLocalhost[0] != '1' )
     {
         hints.ai_flags = AI_PASSIVE;
@@ -474,8 +475,8 @@ bool ListenSocket::Listen( uint16_t port, int backlog )
 
     struct addrinfo* res = nullptr;
 
-#ifndef TRACY_ONLY_IPV4
-    const char* onlyIPv4 = getenv( "TRACY_ONLY_IPV4" );
+#if !defined TRACY_ONLY_IPV4 && !defined TRACY_ONLY_LOCALHOST
+    const char* onlyIPv4 = GetEnvVar( "TRACY_ONLY_IPV4" );
     if( !onlyIPv4 || onlyIPv4[0] != '1' )
     {
         m_sock = addrinfo_and_socket_for_family( port, AF_INET6, &res );
@@ -603,6 +604,7 @@ bool UdpBroadcast::Open( const char* addr, uint16_t port )
     if( !ptr ) return false;
 
     m_sock = sock;
+    inet_pton( AF_INET, addr, &m_addr );
     return true;
 }
 
@@ -623,7 +625,7 @@ int UdpBroadcast::Send( uint16_t port, const void* data, int len )
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons( port );
-    addr.sin_addr.s_addr = INADDR_BROADCAST;
+    addr.sin_addr.s_addr = m_addr;
     return sendto( m_sock, (const char*)data, len, MSG_NOSIGNAL, (sockaddr*)&addr, sizeof( addr ) );
 }
 

@@ -10,6 +10,7 @@
 #include <string>
 #include <string.h>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../common/TracyForceInline.hpp"
@@ -171,7 +172,9 @@ public:
 private:
     struct SourceLocationZones
     {
-        Vector<ZoneThreadData> zones;
+        struct ZtdSort { bool operator()( const ZoneThreadData& lhs, const ZoneThreadData& rhs ) { return lhs.Zone()->Start() < rhs.Zone()->Start(); } };
+
+        SortedVector<ZoneThreadData, ZtdSort> zones;
         int64_t min = std::numeric_limits<int64_t>::max();
         int64_t max = std::numeric_limits<int64_t>::min();
         int64_t total = 0;
@@ -232,7 +235,7 @@ private:
 
     struct DataBlock
     {
-        std::shared_mutex lock;
+        std::mutex lock;
         StringDiscovery<FrameData*> frames;
         FrameData* framesBase;
         Vector<GpuCtxData*> gpuData;
@@ -291,6 +294,7 @@ private:
         unordered_flat_map<uint64_t, unordered_flat_map<CallstackFrameId, uint32_t, CallstackFrameIdHash, CallstackFrameIdCompare>> instructionPointersMap;
         unordered_flat_map<uint64_t, Vector<SampleDataRange>> symbolSamples;
         unordered_flat_map<CallstackFrameId, Vector<SampleDataRange>, CallstackFrameIdHash, CallstackFrameIdCompare> pendingSymbolSamples;
+        unordered_flat_map<uint64_t, Vector<Int48>> childSamples;
         bool newFramesWereReceived = false;
         bool callstackSamplesReady = false;
         bool ghostZonesReady = false;
@@ -386,6 +390,7 @@ public:
         ZoneColor,
         ZoneName,
         MemFree,
+        MemAllocTwice,
         FrameEnd,
         FrameImageIndex,
         FrameImageTwice,
@@ -394,7 +399,7 @@ public:
     };
 
     Worker( const char* addr, uint16_t port );
-    Worker( const std::string& program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots );
+    Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true );
     ~Worker();
 
@@ -403,6 +408,7 @@ public:
     const std::string& GetCaptureName() const { return m_captureName; }
     const std::string& GetCaptureProgram() const { return m_captureProgram; }
     uint64_t GetCaptureTime() const { return m_captureTime; }
+    uint64_t GetExecutableTime() const { return m_executableTime; }
     const std::string& GetHostInfo() const { return m_hostInfo; }
     int64_t GetDelay() const { return m_delay; }
     int64_t GetResolution() const { return m_resolution; }
@@ -411,7 +417,7 @@ public:
     uint32_t GetCpuId() const { return m_data.cpuId; }
     const char* GetCpuManufacturer() const { return m_data.cpuManufacturer; }
 
-    std::shared_mutex& GetDataLock() { return m_data.lock; }
+    std::mutex& GetDataLock() { return m_data.lock; }
     size_t GetFrameCount( const FrameData& fd ) const { return fd.frames.size(); }
     size_t GetFullFrameCount( const FrameData& fd ) const;
     int64_t GetLastTime() const { return m_data.lastTime; }
@@ -439,6 +445,10 @@ public:
     uint64_t GetGhostZonesCount() const { return m_data.ghostCnt; }
     uint32_t GetFrameImageCount() const { return (uint32_t)m_data.frameImage.size(); }
     uint64_t GetStringsCount() const { return m_data.strings.size() + m_data.stringData.size(); }
+#ifndef TRACY_NO_STATISTICS
+    uint64_t GetChildSamplesCountSyms() const { return m_data.childSamples.size(); }
+    uint64_t GetChildSamplesCountFull() const;
+#endif
     uint64_t GetFrameOffset() const { return m_data.frameOffset; }
     const FrameData* GetFramesBase() const { return m_data.framesBase; }
     const Vector<FrameData*>& GetFrames() const { return m_data.frames.Data(); }
@@ -492,6 +502,7 @@ public:
     const VarArray<CallstackFrameId>& GetParentCallstack( uint32_t idx ) const { return *m_data.parentCallstackPayload[idx]; }
     const CallstackFrameData* GetParentCallstackFrame( const CallstackFrameId& ptr ) const;
     const Vector<SampleDataRange>* GetSamplesForSymbol( uint64_t symAddr ) const;
+    const Vector<Int48>* GetChildSamples( uint64_t addr ) const;
 #endif
 
     const CrashEvent& GetCrashEvent() const { return m_data.crashEvent; }
@@ -564,6 +575,7 @@ public:
     bool IsBackgroundDone() const { return m_backgroundDone.load( std::memory_order_relaxed ); }
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
     void Disconnect();
+    bool WasDisconnectIssued() const { return m_disconnect; }
 
     void Write( FileWrite& f );
     int GetTraceVersion() const { return m_traceVersion; }
@@ -588,11 +600,15 @@ public:
 
     std::pair<uint64_t, uint64_t> GetTextureCompressionBytes() const { return std::make_pair( m_texcomp.GetInputBytesCount(), m_texcomp.GetOutputBytesCount() ); }
 
+    void DoPostponedWork();
+
 private:
     void Network();
     void Exec();
     void Query( ServerQuery type, uint64_t data, uint32_t extra = 0 );
     void QueryTerminate();
+    void QuerySourceFile( const char* fn );
+    void QueryDataTransfer( const void* ptr, size_t size );
 
     tracy_force_inline bool DispatchProcess( const QueueItem& ev, const char*& ptr );
     tracy_force_inline bool Process( const QueueItem& ev );
@@ -635,9 +651,12 @@ private:
     tracy_force_inline void ProcessGpuNewContext( const QueueGpuNewContext& ev );
     tracy_force_inline void ProcessGpuZoneBegin( const QueueGpuZoneBegin& ev, bool serial );
     tracy_force_inline void ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool serial );
+    tracy_force_inline void ProcessGpuZoneBeginAllocSrcLoc( const QueueGpuZoneBeginLean& ev, bool serial );
+    tracy_force_inline void ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLean& ev, bool serial );
     tracy_force_inline void ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial );
     tracy_force_inline void ProcessGpuTime( const QueueGpuTime& ev );
     tracy_force_inline void ProcessGpuCalibration( const QueueGpuCalibration& ev );
+    tracy_force_inline void ProcessGpuContextName( const QueueGpuContextName& ev );
     tracy_force_inline MemEvent* ProcessMemAlloc( const QueueMemAlloc& ev );
     tracy_force_inline MemEvent* ProcessMemAllocNamed( const QueueMemAlloc& ev );
     tracy_force_inline MemEvent* ProcessMemFree( const QueueMemFree& ev );
@@ -646,7 +665,7 @@ private:
     tracy_force_inline void ProcessMemAllocCallstackNamed( const QueueMemAlloc& ev );
     tracy_force_inline void ProcessMemFreeCallstack( const QueueMemFree& ev );
     tracy_force_inline void ProcessMemFreeCallstackNamed( const QueueMemFree& ev );
-    tracy_force_inline void ProcessCallstackMemory();
+    tracy_force_inline void ProcessCallstackSerial();
     tracy_force_inline void ProcessCallstack();
     tracy_force_inline void ProcessCallstackSample( const QueueCallstackSample& ev );
     tracy_force_inline void ProcessCallstackFrameSize( const QueueCallstackFrameSize& ev );
@@ -666,6 +685,8 @@ private:
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );
     tracy_force_inline void ProcessZoneBeginAllocSrcLocImpl( ZoneEvent* zone, const QueueZoneBeginLean& ev );
     tracy_force_inline void ProcessGpuZoneBeginImpl( GpuEvent* zone, const QueueGpuZoneBegin& ev, bool serial );
+    tracy_force_inline void ProcessGpuZoneBeginAllocSrcLocImpl( GpuEvent* zone, const QueueGpuZoneBeginLean& ev, bool serial );
+    tracy_force_inline void ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBeginLean& ev, bool serial );
     tracy_force_inline MemEvent* ProcessMemAllocImpl( uint64_t memname, MemData& memdata, const QueueMemAlloc& ev );
     tracy_force_inline MemEvent* ProcessMemFreeImpl( uint64_t memname, MemData& memdata, const QueueMemFree& ev );
 
@@ -675,6 +696,7 @@ private:
     void ZoneColorFailure( uint64_t thread );
     void ZoneNameFailure( uint64_t thread );
     void MemFreeFailure( uint64_t thread );
+    void MemAllocTwiceFailure( uint64_t thread );
     void FrameEndFailure();
     void FrameImageIndexFailure();
     void FrameImageTwiceFailure();
@@ -745,6 +767,7 @@ private:
     void AddExternalThreadName( uint64_t ptr, const char* str, size_t sz );
     void AddFrameImageData( uint64_t ptr, const char* data, size_t sz );
     void AddSymbolCode( uint64_t ptr, const char* data, size_t sz );
+    void AddSourceCode( const char* data, size_t sz );
 
     tracy_force_inline void AddCallstackPayload( uint64_t ptr, const char* data, size_t sz );
     tracy_force_inline void AddCallstackAllocPayload( uint64_t ptr, const char* data, size_t sz );
@@ -753,7 +776,6 @@ private:
     void HandlePlotName( uint64_t name, const char* str, size_t sz );
     void HandleFrameName( uint64_t name, const char* str, size_t sz );
 
-    void HandlePostponedPlots();
     void HandlePostponedSamples();
     void HandlePostponedGhostZones();
 
@@ -836,6 +858,7 @@ private:
     std::string m_captureName;
     std::string m_captureProgram;
     uint64_t m_captureTime;
+    uint64_t m_executableTime;
     std::string m_hostInfo;
     uint64_t m_pid;
     int64_t m_samplingPeriod;
@@ -876,7 +899,7 @@ private:
     uint64_t m_callstackAllocNextIdx = 0;
     uint64_t m_callstackParentNextIdx = 0;
 
-    uint32_t m_memNextCallstack = 0;
+    uint32_t m_serialNextCallstack = 0;
     uint64_t m_memNamePayload = 0;
 
     Slab<64*1024*1024> m_slab;
@@ -937,6 +960,7 @@ private:
     size_t m_tmpBufSize = 0;
 
     unordered_flat_map<uint64_t, uint32_t> m_nextCallstack;
+    std::vector<const char*> m_sourceCodeQuery;
 };
 
 }
