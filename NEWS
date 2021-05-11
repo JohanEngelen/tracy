@@ -13,6 +13,18 @@ v0.x.x (xxxx-xx-xx)
 - Manually disconnecting from the server will no longer display erroneous
   warning message.
 - Added ability to display sample time spent in child function calls.
+- Fixed issue which may have prevented sampling on ARM64.
+- Added TRACY_NO_FRAME_IMAGE macro to disable frame image compression
+  thread.
+- Ctrl and shift keys will now modify mouse wheel zoom speed.
+- Improved user experience in the symbol view window.
+- Added support for Direct3D 11 instrumentation.
+- Vulkan contexts can be now calibrated on Linux.
+- Support loading zstd-compressed chrome traces.
+- Chrome traces with multiple PID entries (and possibly conflicting TIDs)
+  can be now imported. A pseudo-TID will be created for each PID+TID pair
+  in such circumstances.
+- Added support for custom source location tag ("loc") in chrome traces.
 
 
 v0.7.7 (2021-04-01)

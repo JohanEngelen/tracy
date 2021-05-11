@@ -321,8 +321,8 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
             SourceLocation srcloc {
                 StringRef(),
                 StringRef( StringRef::Idx, StoreString( v.name.c_str(), v.name.size() ).idx ),
-                StringRef(),
-                0,
+                StringRef( StringRef::Idx, StoreString( v.locFile.c_str(), v.locFile.size() ).idx ),
+                v.locLine,
                 0
             };
             int key;
@@ -2028,7 +2028,8 @@ void Worker::GetCpuUsageAtTime( int64_t time, int& own, int& other ) const
     // Remove this check when real-time ctxUsage contruction is implemented.
     if( !m_data.ctxUsage.empty() )
     {
-        auto it = std::upper_bound( m_data.ctxUsage.begin(), m_data.ctxUsage.end(), time, [] ( const auto& l, const auto& r ) { return l < r.Time(); } );
+        const auto test = ( time << 16 ) | 0xFFFF;
+        auto it = std::upper_bound( m_data.ctxUsage.begin(), m_data.ctxUsage.end(), test, [] ( const auto& l, const auto& r ) { return l < r._time_other_own; } );
         if( it == m_data.ctxUsage.begin() || it == m_data.ctxUsage.end() ) return;
         --it;
         own = it->Own();
@@ -5352,7 +5353,7 @@ void Worker::ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBe
     }
     else
     {
-        // OpenGL doesn't need per-zone thread id. It still can be sent,
+        // OpenGL and Direct3D11 doesn't need per-zone thread id. It still can be sent,
         // because it may be needed for callstack collection purposes.
         zone->SetThread( 0 );
         ztid = 0;
